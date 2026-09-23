@@ -1,0 +1,8 @@
+group: io.kestra.plugin.qlikcloud.apps
+name: "apps"
+title: "Qlik Cloud Apps"
+description: "Tasks that trigger and monitor Qlik Cloud app reloads"
+body: "Use this task to trigger a reload of a Qlik Cloud app through the Reloads REST API and, by default, wait for it to finish, streaming the reload log to internal storage."
+videos: []
+createdBy: "Kestra Core Team"
+managedBy: "Kestra Core Team"

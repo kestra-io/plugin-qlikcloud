@@ -39,14 +39,15 @@
 
 ## Why
 
-- What user problem does this solve? Teams need a concrete starting point for building and validating new Kestra plugins without recreating the same project scaffolding from scratch.
-- Why would a team adopt this plugin in a workflow? It gives plugin authors a ready-made reference repo they can adapt alongside their own build, test, and publishing workflow.
-- What operational/business outcome does it enable? It shortens plugin delivery time, reduces setup mistakes, and makes internal or partner plugin development more repeatable.
+- What user problem does this solve? Teams running Qlik Cloud analytics need to trigger app reloads and Qlik Automate automations as part of a broader orchestrated pipeline, instead of relying on Qlik's own scheduler in isolation.
+- Why would a team adopt this plugin in a workflow? It lets a Kestra flow trigger a reload or an automation run, wait for it to finish, and react to its outcome (retry, alert, chain a downstream task) alongside the rest of the data pipeline.
+- What operational/business outcome does it enable? Reload failures surface in the same place as every other pipeline failure, freshness of Qlik apps becomes trackable as a Kestra asset, and Qlik Automate runs can be sequenced with upstream data-loading tasks.
 
 ## What
 
 - Provides plugin components under `io.kestra.plugin.qlikcloud`.
-- Includes classes such as `Example`, `Trigger`.
+- `io.kestra.plugin.qlikcloud.apps.Reload` triggers a Qlik Cloud app reload and waits for completion.
+- `io.kestra.plugin.qlikcloud.automations.RunAutomation` triggers a Qlik Automate automation run and waits for completion.
 
 ## Running Kestra locally with this plugin
 

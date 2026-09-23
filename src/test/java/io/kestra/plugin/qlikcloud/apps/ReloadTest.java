@@ -1,0 +1,255 @@
+package io.kestra.plugin.qlikcloud.apps;
+
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import com.github.tomakehurst.wiremock.junit5.WireMockRuntimeInfo;
+import com.github.tomakehurst.wiremock.junit5.WireMockTest;
+import com.github.tomakehurst.wiremock.stubbing.Scenario;
+
+import io.kestra.core.junit.annotations.KestraTest;
+import io.kestra.core.models.property.Property;
+import io.kestra.core.runners.RunContext;
+import io.kestra.core.runners.RunContextFactory;
+import io.kestra.core.utils.TestsUtils;
+
+import jakarta.inject.Inject;
+
+import static com.github.tomakehurst.wiremock.client.WireMock.*;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.*;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+@KestraTest
+@WireMockTest(httpPort = 28282)
+class ReloadTest {
+    @Inject
+    private RunContextFactory runContextFactory;
+
+    private Reload.ReloadBuilder<?, ?> baseBuilder(WireMockRuntimeInfo wireMockRuntimeInfo) {
+        return Reload.builder()
+            .id("reload-task")
+            .type(Reload.class.getName())
+            .tenantUrl(Property.ofValue(wireMockRuntimeInfo.getHttpBaseUrl()))
+            .apiKey(Property.ofValue("test-key"))
+            .appId(Property.ofValue("app-1"))
+            .pollFrequency(Property.ofValue(Duration.ofMillis(100)))
+            .maxDuration(Property.ofValue(Duration.ofSeconds(5)));
+    }
+
+    @Test
+    void succeedsWaitsAndReturnsMetadataAndLog(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-1\", \"status\": \"QUEUED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-1"))
+            .willReturn(okJson("{\"id\": \"reload-1\", \"status\": \"SUCCEEDED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1/reloads/logs/reload-1"))
+            .willReturn(aResponse().withHeader("Content-Type", "text/plain").withBody("log line 1\nlog line 2")));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1"))
+            .willReturn(okJson("{\"attributes\": {\"name\": \"Sales Dashboard\", \"lastReloadTime\": \"2024-01-01T00:00:00Z\"}}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items"))
+            .withQueryParam("resourceId", equalTo("app-1"))
+            .willReturn(okJson("{\"data\": [{\"spaceId\": \"space-1\"}]}")));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        // this also exercises the OSS no-op asset-emission path: runContext.assets().emit() always
+        // throws UnsupportedOperationException outside EE, and the task must still succeed.
+        Reload.Output output = task.run(runContext);
+
+        assertThat(output.getReloadId(), is("reload-1"));
+        assertThat(output.getAppId(), is("app-1"));
+        assertThat(output.getAppName(), is("Sales Dashboard"));
+        assertThat(output.getSpaceId(), is("space-1"));
+        assertThat(output.getStatus(), is("SUCCEEDED"));
+        assertThat(output.getLastReloadTime(), is(notNullValue()));
+        assertThat(output.getLogUri(), is(notNullValue()));
+        assertThat(output.getLogUri().toString(), containsString("kestra://"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"FAILED", "CANCELED", "EXCEEDED_LIMIT"})
+    void failsOnNonSucceededTerminalStatus(String status, WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-2\", \"status\": \"QUEUED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-2"))
+            .willReturn(okJson("{\"id\": \"reload-2\", \"status\": \"" + status + "\", \"errorCode\": \"E1\", \"errorMessage\": \"boom\"}")));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1/reloads/logs/reload-2"))
+            .willReturn(aResponse().withStatus(404)));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
+        assertThat(e.getMessage(), allOf(containsString(status), containsString("E1"), containsString("boom")));
+    }
+
+    @Test
+    void retriesTriggerOn429HonoringRetryAfter(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .inScenario("429-retry")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "1"))
+            .willSetStateTo("retried"));
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .inScenario("429-retry")
+            .whenScenarioStateIs("retried")
+            .willReturn(okJson("{\"id\": \"reload-3\", \"status\": \"QUEUED\"}")));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        Reload.Output output = task.run(runContext);
+
+        assertThat(output.getReloadId(), is("reload-3"));
+        verify(2, postRequestedFor(urlEqualTo("/api/v1/reloads")));
+    }
+
+    @Test
+    void timesOutWhenStillRunningPastMaxDuration(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-4\", \"status\": \"QUEUED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-4"))
+            .willReturn(okJson("{\"id\": \"reload-4\", \"status\": \"RELOADING\"}")));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).maxDuration(Property.ofValue(Duration.ofMillis(300))).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        TimeoutException e = assertThrows(TimeoutException.class, () -> task.run(runContext));
+        assertThat(e.getMessage(), containsString("RELOADING"));
+        // the state entry is left in place on timeout so a retry/restart reattaches instead of duplicating
+        verify(0, postRequestedFor(urlEqualTo("/api/v1/reloads/reload-4/actions/cancel")));
+    }
+
+    @Test
+    void doesNotPollWhenWaitIsFalse(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-5\", \"status\": \"QUEUED\"}")));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        Reload.Output output = task.run(runContext);
+
+        assertThat(output.getReloadId(), is("reload-5"));
+        assertThat(output.getStatus(), is("QUEUED"));
+        assertThat(output.getEndTime(), is(nullValue()));
+        verify(0, getRequestedFor(urlEqualTo("/api/v1/reloads/reload-5")));
+    }
+
+    @Test
+    void reattachAdoptsRunningReloadInsteadOfRetriggering(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-6\", \"status\": \"QUEUED\"}")));
+
+        Reload firstAttempt = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, firstAttempt, Map.of());
+        firstAttempt.run(runContext);
+
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-6"))
+            .inScenario("reattach-running")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("{\"id\": \"reload-6\", \"status\": \"RELOADING\"}"))
+            .willSetStateTo("done"));
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-6"))
+            .inScenario("reattach-running")
+            .whenScenarioStateIs("done")
+            .willReturn(okJson("{\"id\": \"reload-6\", \"status\": \"SUCCEEDED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1/reloads/logs/reload-6")).willReturn(aResponse().withStatus(404)));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1")).willReturn(okJson("{\"attributes\": {}}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
+
+        Reload secondAttempt = baseBuilder(wireMockRuntimeInfo).build();
+        Reload.Output output = secondAttempt.run(runContext);
+
+        assertThat(output.getReloadId(), is("reload-6"));
+        assertThat(output.getStatus(), is("SUCCEEDED"));
+        verify(1, postRequestedFor(urlEqualTo("/api/v1/reloads")));
+    }
+
+    @Test
+    void reattachAdoptsAlreadyFinishedReload(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-7\", \"status\": \"QUEUED\"}")));
+
+        Reload firstAttempt = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, firstAttempt, Map.of());
+        firstAttempt.run(runContext);
+
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-7"))
+            .willReturn(okJson("{\"id\": \"reload-7\", \"status\": \"SUCCEEDED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1/reloads/logs/reload-7")).willReturn(aResponse().withStatus(404)));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1")).willReturn(okJson("{\"attributes\": {}}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
+
+        Reload secondAttempt = baseBuilder(wireMockRuntimeInfo).build();
+        Reload.Output output = secondAttempt.run(runContext);
+
+        assertThat(output.getReloadId(), is("reload-7"));
+        assertThat(output.getStatus(), is("SUCCEEDED"));
+        verify(1, postRequestedFor(urlEqualTo("/api/v1/reloads")));
+    }
+
+    @Test
+    void reattachRetriggersWhenStoredReloadIsGone(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .inScenario("stale-state")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("{\"id\": \"reload-8\", \"status\": \"QUEUED\"}"))
+            .willSetStateTo("first triggered"));
+
+        Reload firstAttempt = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, firstAttempt, Map.of());
+        firstAttempt.run(runContext);
+
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-8")).willReturn(aResponse().withStatus(404)));
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .inScenario("stale-state")
+            .whenScenarioStateIs("first triggered")
+            .willReturn(okJson("{\"id\": \"reload-9\", \"status\": \"QUEUED\"}")));
+
+        Reload secondAttempt = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        Reload.Output output = secondAttempt.run(runContext);
+
+        assertThat(output.getReloadId(), is("reload-9"));
+        verify(2, postRequestedFor(urlEqualTo("/api/v1/reloads")));
+    }
+
+    @Test
+    void killCancelsTheRemoteReload(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-10\", \"status\": \"QUEUED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-10"))
+            .willReturn(okJson("{\"id\": \"reload-10\", \"status\": \"RELOADING\"}")));
+        stubFor(post(urlEqualTo("/api/v1/reloads/reload-10/actions/cancel"))
+            .willReturn(aResponse().withStatus(204)));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo)
+            .maxDuration(Property.ofValue(Duration.ofSeconds(30)))
+            .build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        CompletableFuture<Reload.Output> future = CompletableFuture.supplyAsync(() -> {
+            try {
+                return task.run(runContext);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        Thread.sleep(300);
+        task.kill();
+
+        ExecutionException e = assertThrows(ExecutionException.class, () -> future.get(5, java.util.concurrent.TimeUnit.SECONDS));
+        assertThat(e.getCause().getCause(), instanceOf(InterruptedException.class));
+        verify(1, postRequestedFor(urlEqualTo("/api/v1/reloads/reload-10/actions/cancel")));
+    }
+}
