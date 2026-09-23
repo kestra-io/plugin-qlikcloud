@@ -1,8 +1,10 @@
 package io.kestra.plugin.qlikcloud;
 
 import java.io.IOException;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -16,6 +18,10 @@ import com.fasterxml.jackson.databind.JsonNode;
  */
 public final class QlikResourceResolver {
     private static final int PAGE_LIMIT = 100;
+
+    // Bounds the pagination walk on a pathological or malicious `links.next` chain, so a lookup can
+    // never loop unbounded.
+    private static final int MAX_PAGES = 100;
 
     private QlikResourceResolver() {
     }
@@ -86,16 +92,43 @@ public final class QlikResourceResolver {
     private static List<JsonNode> fetchAllPages(QlikCloudClient client, String firstPathAndQuery) throws IOException {
         List<JsonNode> all = new ArrayList<>();
         String next = firstPathAndQuery;
+        URI tenantUri = URI.create(client.tenantUrl());
+        int pages = 0;
 
         while (next != null) {
+            if (++pages > MAX_PAGES) {
+                throw new IllegalStateException(
+                    "Qlik Cloud pagination exceeded " + MAX_PAGES + " pages while listing '" + firstPathAndQuery + "'; aborting to avoid an unbounded loop."
+                );
+            }
+
             JsonNode page = client.get(next);
             page.path("data").forEach(all::add);
 
             JsonNode href = page.path("links").path("next").path("href");
-            next = href.isMissingNode() || href.isNull() || href.asText().isBlank() ? null : href.asText();
+            next = href.isMissingNode() || href.isNull() || href.asText().isBlank() ? null : requireSameTenant(href.asText(), tenantUri);
         }
 
         return all;
+    }
+
+    /**
+     * Resolves a `links.next.href` (relative or absolute) against the tenant root and refuses to follow
+     * it if it points anywhere else: the bearer token is attached to every request this client makes, so
+     * a foreign host in a pagination link must never be followed.
+     */
+    private static String requireSameTenant(String href, URI tenantUri) {
+        URI resolved = tenantUri.resolve(href);
+        boolean sameOrigin = Objects.equals(resolved.getScheme(), tenantUri.getScheme()) && Objects.equals(resolved.getHost(), tenantUri.getHost());
+
+        if (!sameOrigin) {
+            throw new IllegalStateException(
+                "Qlik Cloud returned a pagination link pointing to '" + resolved + "', outside the configured tenant '" + tenantUri +
+                    "'; refusing to follow it rather than send the API key to another host."
+            );
+        }
+
+        return resolved.toString();
     }
 
     private static String idList(List<JsonNode> nodes, String idField) {

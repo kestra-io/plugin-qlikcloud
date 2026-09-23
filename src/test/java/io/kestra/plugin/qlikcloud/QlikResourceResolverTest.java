@@ -138,4 +138,56 @@ class QlikResourceResolverTest {
         );
         assertThat(e.getMessage(), containsString("'qa' (6ab3d8441214fa62dd549773)"));
     }
+
+    @Test
+    void refusesToFollowANextLinkPointingToAForeignHost(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(
+            get(urlPathEqualTo("/api/v1/spaces"))
+                .willReturn(okJson("""
+                    {"data": [{"id": "space-0", "name": "Sales Analytics Old"}], "links": {"next": {"href": "https://evil.example.com/api/v1/spaces?page=2"}}}
+                    """))
+        );
+
+        QlikCloudClient client = client(wireMockRuntimeInfo);
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> QlikResourceResolver.resolveSpaceId(client, "Sales Analytics"));
+        assertThat(e.getMessage(), containsString("evil.example.com"));
+        // the foreign host is never actually contacted: the check happens before the next GET is made
+        verify(1, getRequestedFor(urlPathEqualTo("/api/v1/spaces")));
+    }
+
+    @Test
+    void followsARelativeNextLinkResolvedAgainstTheTenant(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(
+            get(urlPathEqualTo("/api/v1/spaces"))
+                .withQueryParam("name", equalTo("Sales Analytics"))
+                .willReturn(okJson("""
+                    {"data": [{"id": "space-0", "name": "Sales Analytics Old"}], "links": {"next": {"href": "/api/v1/spaces?page=2"}}}
+                    """))
+        );
+        stubFor(
+            get(urlPathEqualTo("/api/v1/spaces"))
+                .withQueryParam("page", equalTo("2"))
+                .willReturn(okJson("""
+                    {"data": [{"id": "space-1", "name": "Sales Analytics"}], "links": {}}
+                    """))
+        );
+
+        String spaceId = QlikResourceResolver.resolveSpaceId(client(wireMockRuntimeInfo), "Sales Analytics");
+
+        assertThat(spaceId, is("space-1"));
+    }
+
+    @Test
+    void abortsAfterTheMaxPageCountInsteadOfLoopingForever(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(
+            get(urlPathEqualTo("/api/v1/spaces"))
+                .willReturn(okJson("""
+                    {"data": [], "links": {"next": {"href": "/api/v1/spaces?forever=true"}}}
+                    """))
+        );
+
+        QlikCloudClient client = client(wireMockRuntimeInfo);
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> QlikResourceResolver.resolveSpaceId(client, "Sales Analytics"));
+        assertThat(e.getMessage(), containsString("100 pages"));
+    }
 }

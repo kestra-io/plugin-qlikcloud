@@ -2,6 +2,7 @@ package io.kestra.plugin.qlikcloud;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -9,6 +10,7 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -58,6 +60,11 @@ public final class QlikCloudClient implements Closeable {
         return new QlikCloudClient(new HttpClient(runContext, null), normalizeTenantUrl(rTenantUrl), rApiKey);
     }
 
+    /** The normalized tenant root this client talks to, used by {@link QlikResourceResolver} to validate pagination links. */
+    String tenantUrl() {
+        return rTenantUrl;
+    }
+
     static String normalizeTenantUrl(String tenantUrl) {
         String trimmed = tenantUrl.strip();
         if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
@@ -89,8 +96,13 @@ public final class QlikCloudClient implements Closeable {
         return request("POST", pathOrUrl, body, false);
     }
 
-    /** GET as raw text, used for the plain-text reload log endpoint. Never retried: best-effort, caller falls back. */
-    public String getRaw(String pathOrUrl) throws IOException {
+    /**
+     * GET the response body as a stream, used for the plain-text reload log endpoint so a caller can
+     * copy it straight to a file instead of buffering it whole in memory. The consumer is only invoked
+     * for a successful response; a non-2xx status is translated the same way as {@link #get(String)}.
+     * Never retried: best-effort, caller falls back.
+     */
+    public void getStream(String pathOrUrl, Consumer<HttpResponse<InputStream>> consumer) throws IOException {
         HttpRequest request = HttpRequest.builder()
             .uri(resolveUri(pathOrUrl))
             .method("GET")
@@ -99,8 +111,7 @@ public final class QlikCloudClient implements Closeable {
             .build();
 
         try {
-            HttpResponse<String> response = httpClient.request(request, String.class);
-            return response.getBody();
+            httpClient.request(request, consumer);
         } catch (HttpClientResponseException e) {
             throw translateError("GET", pathOrUrl, e);
         } catch (IllegalVariableEvaluationException | HttpClientException e) {

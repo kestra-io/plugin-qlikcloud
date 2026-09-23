@@ -75,6 +75,41 @@ class ReloadTest {
         assertThat(output.getLogUri().toString(), containsString("kestra://"));
     }
 
+    @Test
+    void streamsALargeLogWithoutTruncatingStorageContent(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        int lineCount = 20_000;
+        StringBuilder hugeLog = new StringBuilder();
+        for (int i = 0; i < lineCount; i++) {
+            hugeLog.append("line ").append(i).append('\n');
+        }
+
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-huge\", \"status\": \"QUEUED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-huge"))
+            .willReturn(okJson("{\"id\": \"reload-huge\", \"status\": \"SUCCEEDED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1/reloads/logs/reload-huge"))
+            .willReturn(aResponse().withHeader("Content-Type", "text/plain").withBody(hugeLog.toString())));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1")).willReturn(okJson("{\"attributes\": {}}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        Reload.Output output = task.run(runContext);
+
+        assertThat(output.getLogUri(), is(notNullValue()));
+
+        // the log stored in internal storage must be complete, not just the bounded tail logged to the task logger
+        long storedLineCount;
+        try (
+            var stream = runContext.storage().getFile(output.getLogUri());
+            var reader = new java.io.BufferedReader(new java.io.InputStreamReader(stream, java.nio.charset.StandardCharsets.UTF_8))
+        ) {
+            storedLineCount = reader.lines().count();
+        }
+        assertThat(storedLineCount, is((long) lineCount));
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"FAILED", "CANCELED", "EXCEEDED_LIMIT"})
     void failsOnNonSucceededTerminalStatus(String status, WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {

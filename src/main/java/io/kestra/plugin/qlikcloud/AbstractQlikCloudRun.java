@@ -89,7 +89,15 @@ public abstract class AbstractQlikCloudRun extends AbstractQlikCloudTask impleme
             run resumes polling, an already-finished run is adopted as-is. A stored id no longer found on Qlik \
             Cloud (404) logs a warning and triggers a fresh run. The trigger call itself is never blindly \
             retried on an ambiguous failure (e.g. a timeout), since that could create a duplicate run; the \
-            failure surfaces so a flow-level retry or a manual restart can safely re-attach or re-trigger."""
+            failure surfaces so a flow-level retry or a manual restart can safely re-attach or re-trigger.
+
+            A manual Restart of an execution on the same flow revision keeps the original taskrun ids, so this \
+            remembered run is still found afterward. In particular, after a `maxDuration` timeout or a `wait: \
+            false` return, the remembered entry is deliberately kept (the remote run may still be in progress): \
+            a later Restart of that taskrun then reattaches to it instead of triggering a fresh one. To force a \
+            brand-new run on the next attempt regardless of what is remembered — for example after fixing the \
+            app or automation itself — set `reattach: false` for that attempt, or clear it by giving the task a \
+            different id (a flow update that changes the taskrun id)."""
     )
     @Builder.Default
     @PluginProperty(group = "advanced")

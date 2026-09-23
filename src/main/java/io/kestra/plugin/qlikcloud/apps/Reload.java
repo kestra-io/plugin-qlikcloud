@@ -1,15 +1,25 @@
 package io.kestra.plugin.qlikcloud.apps;
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -147,6 +157,10 @@ public class Reload extends AbstractQlikCloudRun implements RunnableTask<Reload.
     @PluginProperty(group = "main")
     Property<Boolean> partial = Property.ofValue(Boolean.FALSE);
 
+    // Not annotated with @Min(1)/@Max(10): jakarta.validation's built-in constraint validators only
+    // support Number and CharSequence, not a Property<Integer> wrapper, so Kestra's ModelValidator would
+    // throw UnexpectedTypeException (HV000030) the moment any flow using this task is validated,
+    // regardless of the actual value. The bound is enforced manually in trigger(), once rendered.
     @Schema(title = "Reload queue weight", description = "Queue priority for the reload, from 1 (lowest) to 10 (highest). Left unset, Qlik Cloud applies its own default.")
     @PluginProperty(group = "main")
     Property<Integer> weight;
@@ -322,32 +336,86 @@ public class Reload extends AbstractQlikCloudRun implements RunnableTask<Reload.
     }
 
     private URI streamLog(RunContext runContext, String appId, String reloadId) {
-        String logText;
-        try (QlikCloudClient client = client(runContext)) {
-            logText = client.getRaw("/api/v1/apps/" + QlikCloudClient.encode(appId) + "/reloads/logs/" + QlikCloudClient.encode(reloadId));
+        try {
+            return streamLogFromEndpoint(runContext, appId, reloadId);
         } catch (Exception e) {
             runContext.logger().warn("Failed to fetch the reload log stream for reload '{}', falling back to the reload resource's `log` field: {}", reloadId, e.getMessage());
-            try (QlikCloudClient client = client(runContext)) {
-                logText = client.get("/api/v1/reloads/" + QlikCloudClient.encode(reloadId)).path("log").asText(null);
-            } catch (Exception fallbackError) {
-                runContext.logger().warn("Failed to fetch the reload log fallback for reload '{}': {}", reloadId, fallbackError.getMessage());
+            return streamLogFallback(runContext, reloadId);
+        }
+    }
+
+    private URI streamLogFromEndpoint(RunContext runContext, String appId, String reloadId) throws Exception {
+        try (QlikCloudClient client = client(runContext)) {
+            AtomicReference<URI> result = new AtomicReference<>();
+            AtomicReference<IOException> writeFailure = new AtomicReference<>();
+
+            client.getStream(
+                "/api/v1/apps/" + QlikCloudClient.encode(appId) + "/reloads/logs/" + QlikCloudClient.encode(reloadId),
+                response -> {
+                    try {
+                        result.set(copyLogToStorage(runContext, reloadId, response.getBody()));
+                    } catch (IOException e) {
+                        writeFailure.set(e);
+                    }
+                }
+            );
+
+            if (writeFailure.get() != null) {
+                throw writeFailure.get();
+            }
+            return result.get();
+        }
+    }
+
+    private URI streamLogFallback(RunContext runContext, String reloadId) {
+        try (QlikCloudClient client = client(runContext)) {
+            String logText = client.get("/api/v1/reloads/" + QlikCloudClient.encode(reloadId)).path("log").asText(null);
+            if (logText == null || logText.isBlank()) {
                 return null;
+            }
+            // The reload resource embeds the log inline in its JSON body, so the full string is already
+            // in memory by the time we get here; still routed through the same bounded-tail copy so it
+            // is not duplicated again as a separate List<String> and byte[] on its way to storage.
+            return copyLogToStorage(runContext, reloadId, new ByteArrayInputStream(logText.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            runContext.logger().warn("Failed to fetch the reload log fallback for reload '{}': {}", reloadId, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Copies a reload log straight to an internal-storage temp file without buffering the whole log in
+     * memory, while keeping only a ring buffer of the last {@link #LOG_TAIL_LINES} lines to log to the
+     * task's own logger.
+     */
+    private URI copyLogToStorage(RunContext runContext, String reloadId, InputStream body) throws IOException {
+        Path tempFile = runContext.workingDir().createTempFile(".log");
+        Deque<String> tail = new ArrayDeque<>(LOG_TAIL_LINES);
+        boolean any = false;
+
+        try (
+            BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8));
+            BufferedWriter writer = Files.newBufferedWriter(tempFile, StandardCharsets.UTF_8)
+        ) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                any = true;
+                writer.write(line);
+                writer.newLine();
+                if (tail.size() == LOG_TAIL_LINES) {
+                    tail.removeFirst();
+                }
+                tail.addLast(line);
             }
         }
 
-        if (logText == null || logText.isBlank()) {
+        if (!any) {
+            Files.deleteIfExists(tempFile);
             return null;
         }
 
-        List<String> lines = logText.lines().toList();
-        lines.subList(Math.max(0, lines.size() - LOG_TAIL_LINES), lines.size()).forEach(runContext.logger()::info);
-
-        try {
-            return runContext.storage().putFile(new ByteArrayInputStream(logText.getBytes(StandardCharsets.UTF_8)), "reload-" + reloadId + ".log");
-        } catch (Exception e) {
-            runContext.logger().warn("Failed to store the reload log for reload '{}': {}", reloadId, e.getMessage());
-            return null;
-        }
+        tail.forEach(runContext.logger()::info);
+        return runContext.storage().putFile(tempFile.toFile());
     }
 
     record AppMetadata(String name, String spaceId, Instant lastReloadTime) {
