@@ -14,6 +14,7 @@ import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.RunnableTask;
 import io.kestra.core.runners.RunContext;
 import io.kestra.plugin.qlikcloud.AbstractQlikCloudRun;
+import io.kestra.plugin.qlikcloud.QlikCloudApiException;
 import io.kestra.plugin.qlikcloud.QlikCloudClient;
 import io.kestra.plugin.qlikcloud.QlikResourceResolver;
 
@@ -89,6 +90,8 @@ import lombok.experimental.SuperBuilder;
                     tenantUrl: https://mytenant.eu.qlikcloud.com
                     apiKey: "{{ secret('QLIK_API_KEY') }}"
                     appId: 70a3f4c2b2c3d4e5f6a7b8c9
+                    assets:
+                      enableAuto: true
                 """
         )
     }
@@ -136,10 +139,18 @@ public class RunAutomation extends AbstractQlikCloudRun implements RunnableTask<
 
     @Override
     protected TriggerOutcome trigger(RunContext runContext, QlikCloudClient client, String resolvedAutomationId) throws Exception {
-        JsonNode response = client.post(
-            "/api/v1/automations/" + QlikCloudClient.encode(resolvedAutomationId) + "/runs",
-            Map.of("context", RUN_CONTEXT_VALUE)
-        );
+        JsonNode response;
+        try {
+            response = client.post(
+                "/api/v1/automations/" + QlikCloudClient.encode(resolvedAutomationId) + "/runs",
+                Map.of("context", RUN_CONTEXT_VALUE)
+            );
+        } catch (QlikCloudApiException e) {
+            if (e.statusCode() == 404) {
+                throw new IllegalStateException("Automation '" + resolvedAutomationId + "' not found or not accessible with this API key", e);
+            }
+            throw e;
+        }
 
         String runId = response.path("id").asText(null);
         if (runId == null) {

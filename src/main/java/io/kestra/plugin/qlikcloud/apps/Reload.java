@@ -24,6 +24,7 @@ import io.kestra.core.queues.QueueException;
 import io.kestra.core.runners.AssetEmit;
 import io.kestra.core.runners.RunContext;
 import io.kestra.plugin.qlikcloud.AbstractQlikCloudRun;
+import io.kestra.plugin.qlikcloud.QlikCloudApiException;
 import io.kestra.plugin.qlikcloud.QlikCloudClient;
 import io.kestra.plugin.qlikcloud.QlikResourceResolver;
 
@@ -46,7 +47,9 @@ import lombok.experimental.SuperBuilder;
         Starts a reload of a Qlik Cloud app through the Reloads REST API and, by default, waits for it to \
         reach a final status, streaming the reload log to internal storage. On success it emits a Custom \
         asset (`io.kestra.plugin.qlikcloud.assets.App`) so downstream tools can track the app's freshness; \
-        asset emission is a no-op on Kestra OSS."""
+        asset emission is a no-op on Kestra OSS. It also requires `assets.enableAuto: true` on this task \
+        (a Kestra core setting, defaulting to false) — without it, the asset is silently dropped even \
+        though `emitAssets` defaults to true."""
 )
 @Plugin(
     examples = {
@@ -63,6 +66,8 @@ import lombok.experimental.SuperBuilder;
                     tenantUrl: https://mytenant.eu.qlikcloud.com
                     apiKey: "{{ secret('QLIK_API_KEY') }}"
                     appId: 60f2e3b1a1b2c3d4e5f6a7b8
+                    assets:
+                      enableAuto: true
                 """
         ),
         @Example(
@@ -79,6 +84,8 @@ import lombok.experimental.SuperBuilder;
                     apiKey: "{{ secret('QLIK_API_KEY') }}"
                     spaceName: Sales Analytics
                     appName: Sales Dashboard
+                    assets:
+                      enableAuto: true
                 """
         ),
         @Example(
@@ -98,6 +105,8 @@ import lombok.experimental.SuperBuilder;
                     variables:
                       START_DATE: "2024-01-01"
                       END_DATE: "2024-01-31"
+                    assets:
+                      enableAuto: true
                 """
         ),
         @Example(
@@ -149,7 +158,15 @@ public class Reload extends AbstractQlikCloudRun implements RunnableTask<Reload.
     @PluginProperty(group = "main")
     Property<Map<String, String>> variables;
 
-    @Schema(title = "Emit an app asset", description = "If true (default), emits a Custom asset for the app after a successful reload. No-op on Kestra OSS.")
+    @Schema(
+        title = "Emit an app asset",
+        description = """
+            If true (default), emits a Custom asset for the app after a successful reload; set to false to opt \
+            this task out even when asset emission is otherwise enabled. This is a per-task opt-out on top of \
+            Kestra's own `assets.enableAuto` gate (default false): both must be true for the asset to actually \
+            be recorded — `emitAssets: true` alone does nothing without `assets: { enableAuto: true }` on this \
+            task. No-op on Kestra OSS regardless."""
+    )
     @Builder.Default
     @PluginProperty(group = "advanced")
     Property<Boolean> emitAssets = Property.ofValue(Boolean.TRUE);
@@ -191,13 +208,32 @@ public class Reload extends AbstractQlikCloudRun implements RunnableTask<Reload.
             body.put("variables", rVariables);
         }
 
-        JsonNode response = client.post("/api/v1/reloads", body);
+        JsonNode response;
+        try {
+            response = client.post("/api/v1/reloads", body);
+        } catch (QlikCloudApiException e) {
+            if ("RELOADS-007".equals(e.errorCode())) {
+                throw new IllegalStateException(
+                    "A reload is already pending/in progress for app '" + resolvedAppId + "'; wait for it to finish or cancel it.", e
+                );
+            }
+            if (e.statusCode() == 404) {
+                throw new IllegalStateException("App '" + resolvedAppId + "' not found or not accessible with this API key", e);
+            }
+            throw e;
+        }
+
         String reloadId = response.path("id").asText(null);
         if (reloadId == null) {
             throw new IllegalStateException("Qlik Cloud did not return a reload id when triggering a reload for app '" + resolvedAppId + "'");
         }
 
         return new TriggerOutcome(reloadId, statusFromNode(response));
+    }
+
+    @Override
+    protected String describeTriggered(String runId, String resolvedAppId) {
+        return "Triggered reload '" + runId + "' for app '" + resolvedAppId + "'";
     }
 
     @Override
@@ -314,7 +350,7 @@ public class Reload extends AbstractQlikCloudRun implements RunnableTask<Reload.
         }
     }
 
-    private record AppMetadata(String name, String spaceId, Instant lastReloadTime) {
+    record AppMetadata(String name, String spaceId, Instant lastReloadTime) {
     }
 
     private AppMetadata fetchAppMetadata(RunContext runContext, String appId, String knownSpaceId) {
@@ -341,7 +377,8 @@ public class Reload extends AbstractQlikCloudRun implements RunnableTask<Reload.
         }
     }
 
-    private void emitAsset(RunContext runContext, RunOutcome outcome, AppMetadata metadata) {
+    /** Package-visible so the app-name-as-displayName mapping is unit-testable without an EE asset emitter. */
+    Custom buildAsset(RunContext runContext, RunOutcome outcome, AppMetadata metadata) throws Exception {
         Map<String, Object> metadataMap = new LinkedHashMap<>();
         if (metadata != null) {
             if (metadata.name() != null) {
@@ -356,17 +393,20 @@ public class Reload extends AbstractQlikCloudRun implements RunnableTask<Reload.
         }
         metadataMap.put("reloadId", outcome.runId());
         metadataMap.put("reloadStatus", outcome.status().raw());
+        metadataMap.put("tenantUrl", runContext.render(this.tenantUrl).as(String.class).orElse(null));
+        metadataMap.put("partial", runContext.render(this.partial).as(Boolean.class).orElse(Boolean.FALSE));
 
+        return Custom.builder()
+            .id(outcome.resolvedResourceId())
+            .type(APP_ASSET_TYPE)
+            .displayName(metadata != null ? metadata.name() : null)
+            .metadata(metadataMap)
+            .build();
+    }
+
+    private void emitAsset(RunContext runContext, RunOutcome outcome, AppMetadata metadata) {
         try {
-            metadataMap.put("tenantUrl", runContext.render(this.tenantUrl).as(String.class).orElse(null));
-            metadataMap.put("partial", runContext.render(this.partial).as(Boolean.class).orElse(Boolean.FALSE));
-
-            Custom asset = Custom.builder()
-                .id(outcome.resolvedResourceId())
-                .type(APP_ASSET_TYPE)
-                .metadata(metadataMap)
-                .build();
-
+            Custom asset = buildAsset(runContext, outcome, metadata);
             runContext.assets().emit(new AssetEmit(List.of(), List.of(asset)));
         } catch (UnsupportedOperationException e) {
             runContext.logger().debug("Asset emission is not supported in this edition, skipping.");

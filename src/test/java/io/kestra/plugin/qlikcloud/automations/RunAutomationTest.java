@@ -190,4 +190,18 @@ class RunAutomationTest {
         assertThat(e.getCause().getCause(), instanceOf(InterruptedException.class));
         verify(1, postRequestedFor(urlEqualTo("/api/v1/automations/automation-1/runs/run-7/actions/stop")));
     }
+
+    @Test
+    void notFoundOnTriggerNamesTheAutomationId(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
+            .willReturn(aResponse().withStatus(404).withBody("""
+                {"errors": [{"code": "NOT-FOUND", "title": "Not Found", "detail": "Resource not found."}]}
+                """)));
+
+        RunAutomation task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
+        assertThat(e.getMessage(), allOf(containsString("automation-1"), containsString("not found")));
+    }
 }

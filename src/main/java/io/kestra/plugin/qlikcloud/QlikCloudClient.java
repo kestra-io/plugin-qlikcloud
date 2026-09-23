@@ -8,6 +8,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -32,6 +34,15 @@ public final class QlikCloudClient implements Closeable {
     private static final int MAX_ATTEMPTS = 5;
     private static final Duration INITIAL_BACKOFF = Duration.ofSeconds(2);
     private static final Duration MAX_BACKOFF = Duration.ofSeconds(60);
+
+    // Qlik answers these with a 429 even though they are not a rate limit (e.g. a reload already
+    // pending for the same app): retrying them just delays an error that will never resolve on its own.
+    // Note: the underlying Apache HttpClient (built by Kestra's own HttpClient, which exposes no
+    // retry configuration) already retries a 429/503 once on its own, honoring Retry-After, before our
+    // code ever sees the response — this is unavoidable through Kestra's public HTTP client API. What
+    // we control is not adding any further, additional backoff on top of that single hidden retry once
+    // we do see one of these codes.
+    private static final Set<String> NON_RETRIABLE_429_ERROR_CODES = Set.of("RELOADS-007");
 
     private final HttpClient httpClient;
     private final String rTenantUrl;
@@ -121,7 +132,7 @@ public final class QlikCloudClient implements Closeable {
                 int code = e.getResponse().getStatus().getCode();
                 boolean lastAttempt = attempt == MAX_ATTEMPTS;
 
-                if (code == 429 && !lastAttempt) {
+                if (code == 429 && !lastAttempt && !NON_RETRIABLE_429_ERROR_CODES.contains(extractErrorCode(e))) {
                     sleep(retryAfter(e).orElse(backoff));
                     backoff = cappedDouble(backoff);
                     continue;
@@ -189,34 +200,47 @@ public final class QlikCloudClient implements Closeable {
     private static QlikCloudApiException translateError(String method, String pathOrUrl, HttpClientResponseException e) {
         int code = e.getResponse().getStatus().getCode();
         String detail = extractErrorDetail(e);
+        String errorCode = extractErrorCode(e);
         String message = "Qlik Cloud API call " + method + " " + pathOrUrl + " failed with HTTP " + code +
             (detail != null ? ": " + detail : "");
-        return new QlikCloudApiException(message, code, e);
+        return new QlikCloudApiException(message, code, errorCode, e);
     }
 
-    private static String extractErrorDetail(HttpClientResponseException e) {
+    private static String bodyAsString(HttpClientResponseException e) {
         Object rawBody = e.getResponse().getBody();
-        String bodyString = switch (rawBody) {
+        return switch (rawBody) {
             case byte[] bytes when bytes.length > 0 -> new String(bytes, StandardCharsets.UTF_8);
             case String s when !s.isBlank() -> s;
             case null, default -> null;
         };
+    }
+
+    /** The first {@code errors[]} entry of the response body, or null when absent/not JSON. */
+    private static JsonNode firstError(String bodyString) {
         if (bodyString == null) {
             return null;
         }
-
         try {
-            JsonNode node = JacksonMapper.ofJson().readTree(bodyString);
-            JsonNode errors = node.path("errors");
-            if (errors.isArray() && !errors.isEmpty()) {
-                JsonNode first = errors.get(0);
-                String title = first.path("title").asText(null);
-                String detail = first.path("detail").asText(null);
-                String joined = Stream.of(title, detail).filter(Objects::nonNull).collect(java.util.stream.Collectors.joining(" - "));
-                return joined.isBlank() ? bodyString : joined;
-            }
+            JsonNode errors = JacksonMapper.ofJson().readTree(bodyString).path("errors");
+            return errors.isArray() && !errors.isEmpty() ? errors.get(0) : null;
         } catch (IOException ignored) {
-            // not JSON: fall through and surface the raw body
+            return null;
+        }
+    }
+
+    static String extractErrorCode(HttpClientResponseException e) {
+        JsonNode first = firstError(bodyAsString(e));
+        return first != null ? first.path("code").asText(null) : null;
+    }
+
+    private static String extractErrorDetail(HttpClientResponseException e) {
+        String bodyString = bodyAsString(e);
+        JsonNode first = firstError(bodyString);
+        if (first != null) {
+            String title = first.path("title").asText(null);
+            String detail = first.path("detail").asText(null);
+            String joined = Stream.of(title, detail).filter(Objects::nonNull).collect(Collectors.joining(" - "));
+            return joined.isBlank() ? bodyString : joined;
         }
         return bodyString;
     }

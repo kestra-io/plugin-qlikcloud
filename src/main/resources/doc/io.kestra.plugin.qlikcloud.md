@@ -12,7 +12,23 @@ Both tasks below target their resource *either* by id *or* by `spaceName` togeth
 
 Both tasks support `wait` (default `true`, poll until the run finishes), `pollFrequency` (default `PT10S`), `maxDuration` (default `PT4H`), and `reattach` (default `true`): if the worker restarts mid-poll, or the task is manually restarted, the task reattaches to the run it already triggered (tracked by taskrun id) instead of triggering a duplicate.
 
-- **`apps.Reload`** — triggers a reload via `appId` or `spaceName` + `appName`. Set `partial: true` for a partial reload, `weight` (1-10) to set the queue priority, and `variables` (at most 20 entries, 256 characters each) to pass reload variables to the app's load script. On completion, the full reload log is stored to internal storage (`logUri`) and a bounded tail is logged; a failed, canceled, or exceeded-limit reload fails the task with the Qlik error code/message. On success, `emitAssets` (default `true`) emits a Custom asset (`io.kestra.plugin.qlikcloud.assets.App`) carrying the app's freshness — a no-op on Kestra OSS.
+- **`apps.Reload`** — triggers a reload via `appId` or `spaceName` + `appName`. Set `partial: true` for a partial reload, `weight` (1-10) to set the queue priority, and `variables` (at most 20 entries, 256 characters each) to pass reload variables to the app's load script. On completion, the full reload log is stored to internal storage (`logUri`) and a bounded tail is logged; a failed, canceled, or exceeded-limit reload fails the task with the Qlik error code/message. A `429` for an already-pending reload on the same app (Qlik code `RELOADS-007`) fails immediately instead of being retried as a rate limit. On success, `emitAssets` (default `true`) emits a Custom asset (`io.kestra.plugin.qlikcloud.assets.App`) carrying the app's freshness — a no-op on Kestra OSS, and also a no-op on EE unless `assets: { enableAuto: true }` is set on the task (see below).
 - **`automations.RunAutomation`** — triggers a run via `automationId` or `spaceName` + `automationName`. A run that `finished with warnings` counts as a success unless `failOnWarnings` is set. Automation inputs are out of scope: they require the automation's Triggered mode and a per-automation webhook token, not this task.
 
 Both tasks call the equivalent cancel/stop action when the task is killed.
+
+### Asset emission gotcha
+
+`Reload`'s asset is only recorded when **both** are true: the task's own `emitAssets` (default `true`) and Kestra's core `assets.enableAuto` (default `false`, opt-in per task). Without `assets: { enableAuto: true }` on the `Reload` task, the emit call runs but Kestra silently drops it — `emitAssets: true` alone does nothing:
+
+```yaml
+- id: reload
+  type: io.kestra.plugin.qlikcloud.apps.Reload
+  tenantUrl: https://mytenant.eu.qlikcloud.com
+  apiKey: "{{ secret('QLIK_API_KEY') }}"
+  appId: 60f2e3b1a1b2c3d4e5f6a7b8
+  assets:
+    enableAuto: true
+```
+
+`emitAssets: false` remains a per-task opt-out for when `enableAuto` is set for other reasons but this particular `Reload` should not emit its app asset.

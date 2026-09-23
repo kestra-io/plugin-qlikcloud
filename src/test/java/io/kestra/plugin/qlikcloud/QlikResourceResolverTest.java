@@ -15,6 +15,7 @@ import jakarta.inject.Inject;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -102,7 +103,7 @@ class QlikResourceResolverTest {
                     """))
         );
 
-        QlikResourceResolver.ResolvedResource resolved = QlikResourceResolver.resolveResourceId(client(wireMockRuntimeInfo), "space-1", "Sales Dashboard", "app");
+        QlikResourceResolver.ResolvedResource resolved = QlikResourceResolver.resolveResourceId(client(wireMockRuntimeInfo), "space-1", "Sales Analytics", "Sales Dashboard", "app");
 
         assertThat(resolved.resourceId(), is("app-1"));
         assertThat(resolved.spaceId(), is("space-1"));
@@ -118,6 +119,23 @@ class QlikResourceResolverTest {
         );
 
         QlikCloudClient client = client(wireMockRuntimeInfo);
-        assertThrows(IllegalArgumentException.class, () -> QlikResourceResolver.resolveResourceId(client, "space-1", "Dashboard", "app"));
+        assertThrows(IllegalArgumentException.class, () -> QlikResourceResolver.resolveResourceId(client, "space-1", "Sales Analytics", "Dashboard", "app"));
+    }
+
+    @Test
+    void notFoundErrorNamesTheSpaceByNameAndId(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(
+            get(urlPathEqualTo("/api/v1/items"))
+                .willReturn(okJson("""
+                    {"data": [], "links": {}}
+                    """))
+        );
+
+        QlikCloudClient client = client(wireMockRuntimeInfo);
+        IllegalArgumentException e = assertThrows(
+            IllegalArgumentException.class,
+            () -> QlikResourceResolver.resolveResourceId(client, "6ab3d8441214fa62dd549773", "qa", "does-not-exist", "app")
+        );
+        assertThat(e.getMessage(), containsString("'qa' (6ab3d8441214fa62dd549773)"));
     }
 }

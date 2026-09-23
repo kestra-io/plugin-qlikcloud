@@ -45,7 +45,7 @@ public final class QlikResourceResolver {
         return exact.getFirst().path("id").asText();
     }
 
-    public static ResolvedResource resolveResourceId(QlikCloudClient client, String spaceId, String rName, String resourceType) throws IOException {
+    public static ResolvedResource resolveResourceId(QlikCloudClient client, String spaceId, String rSpaceName, String rName, String resourceType) throws IOException {
         List<JsonNode> items = fetchAllPages(
             client,
             "/api/v1/items?spaceId=" + QlikCloudClient.encode(spaceId) +
@@ -58,12 +58,14 @@ public final class QlikResourceResolver {
             .filter(node -> rName.equalsIgnoreCase(node.path("name").asText("")))
             .toList();
 
+        String spaceDescription = "'" + rSpaceName + "' (" + spaceId + ")";
+
         if (exact.isEmpty()) {
-            throw new IllegalArgumentException("No " + resourceType + " named '" + rName + "' was found in space '" + spaceId + "'.");
+            throw new IllegalArgumentException("No " + resourceType + " named '" + rName + "' was found in space " + spaceDescription + ".");
         }
         if (exact.size() > 1) {
             throw new IllegalArgumentException(
-                "Several " + resourceType + "s are named '" + rName + "' in space '" + spaceId + "': " +
+                "Several " + resourceType + "s are named '" + rName + "' in space " + spaceDescription + ": " +
                     idList(exact, "resourceId") + ". Target the resource by id instead."
             );
         }

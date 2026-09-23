@@ -46,7 +46,16 @@
 ## What
 
 - Provides plugin components under `io.kestra.plugin.qlikcloud`.
-- `io.kestra.plugin.qlikcloud.apps.Reload` triggers a Qlik Cloud app reload and waits for completion.
+- `io.kestra.plugin.qlikcloud.apps.Reload` triggers a Qlik Cloud app reload and waits for completion. On success it emits an app asset — this requires `assets: { enableAuto: true }` on the task, since Kestra's asset emission is opt-in (default `false`); without it, the emit is silently dropped even though the task's own `emitAssets` property defaults to `true`:
+  ```yaml
+  - id: reload
+    type: io.kestra.plugin.qlikcloud.apps.Reload
+    tenantUrl: https://mytenant.eu.qlikcloud.com
+    apiKey: "{{ secret('QLIK_API_KEY') }}"
+    appId: 60f2e3b1a1b2c3d4e5f6a7b8
+    assets:
+      enableAuto: true
+  ```
 - `io.kestra.plugin.qlikcloud.automations.RunAutomation` triggers a Qlik Automate automation run and waits for completion.
 
 ## Running Kestra locally with this plugin

@@ -252,4 +252,87 @@ class ReloadTest {
         assertThat(e.getCause().getCause(), instanceOf(InterruptedException.class));
         verify(1, postRequestedFor(urlEqualTo("/api/v1/reloads/reload-10/actions/cancel")));
     }
+
+    @Test
+    void failsFastOnPendingReloadInsteadOfRetryingAs429(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        // A short Retry-After keeps this test fast: the underlying Apache HTTP client (which Kestra's
+        // HttpClient does not expose a way to reconfigure) retries a 429 once on its own before our own
+        // code ever sees it, honoring this header. The point of this test is that RELOADS-007 must not
+        // add any further, additional backoff of its own on top of that single, unavoidable retry.
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "1").withBody("""
+                {"errors": [{"code": "RELOADS-007", "title": "Too Many Requests", "detail": "A pending reload request already exists for this app"}]}
+                """)));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        long start = System.currentTimeMillis();
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
+        long elapsedMs = System.currentTimeMillis() - start;
+
+        assertThat(e.getMessage(), allOf(containsString("already pending"), containsString("app-1")));
+        assertThat("must not add its own extra backoff beyond the transport's single built-in 429 retry", elapsedMs, lessThan(3000L));
+    }
+
+    @Test
+    void stillRetriesOrdinary429RateLimits(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .inScenario("plain-429")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "1").withBody("""
+                {"errors": [{"code": "TOO-MANY-REQUESTS", "title": "Too Many Requests", "detail": "slow down"}]}
+                """))
+            .willSetStateTo("retried"));
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .inScenario("plain-429")
+            .whenScenarioStateIs("retried")
+            .willReturn(okJson("{\"id\": \"reload-11\", \"status\": \"QUEUED\"}")));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        Reload.Output output = task.run(runContext);
+
+        assertThat(output.getReloadId(), is("reload-11"));
+        verify(2, postRequestedFor(urlEqualTo("/api/v1/reloads")));
+    }
+
+    @Test
+    void notFoundOnTriggerNamesTheAppId(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(aResponse().withStatus(404).withBody("""
+                {"errors": [{"code": "RELOADS-004", "title": "Not Found", "detail": "Resource not found."}]}
+                """)));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
+        assertThat(e.getMessage(), allOf(containsString("app-1"), containsString("not found")));
+    }
+
+    @Test
+    void assetDisplayNameIsTheAppName() throws Exception {
+        Reload task = Reload.builder()
+            .id("reload-task")
+            .type(Reload.class.getName())
+            .tenantUrl(Property.ofValue("http://localhost:1"))
+            .apiKey(Property.ofValue("test-key"))
+            .appId(Property.ofValue("app-1"))
+            .build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        var outcome = new io.kestra.plugin.qlikcloud.AbstractQlikCloudRun.RunOutcome(
+            "app-1", "space-1", "reload-1",
+            new io.kestra.plugin.qlikcloud.AbstractQlikCloudRun.RunStatus("SUCCEEDED", true, true, null),
+            java.time.Instant.now(), java.time.Instant.now(), true
+        );
+        var metadata = new Reload.AppMetadata("Sales Dashboard", "space-1", java.time.Instant.now());
+
+        var asset = task.buildAsset(runContext, outcome, metadata);
+
+        assertThat(asset.getDisplayName(), is("Sales Dashboard"));
+        assertThat(asset.getId(), is("app-1"));
+    }
 }

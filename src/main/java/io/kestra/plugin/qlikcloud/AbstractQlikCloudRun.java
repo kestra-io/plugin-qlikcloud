@@ -121,6 +121,11 @@ public abstract class AbstractQlikCloudRun extends AbstractQlikCloudTask impleme
 
     protected abstract void cancelRemote(RunContext runContext, String resolvedResourceId, String runId);
 
+    /** Log line emitted right after a successful trigger. Override to use resource-specific wording. */
+    protected String describeTriggered(String runId, String resolvedResourceId) {
+        return "Triggered " + resourceType() + " run '" + runId + "' on " + resourceType() + " '" + resolvedResourceId + "'";
+    }
+
     public record TriggerOutcome(String runId, RunStatus status) {
     }
 
@@ -199,7 +204,7 @@ public abstract class AbstractQlikCloudRun extends AbstractQlikCloudTask impleme
                 TriggerOutcome triggered = trigger(runContext, client, resolvedResourceId);
                 runId = triggered.runId();
                 status = triggered.status();
-                logger.info("Triggered {} run '{}' on {} '{}'", resourceType(), runId, resourceType(), resolvedResourceId);
+                logger.info(describeTriggered(runId, resolvedResourceId));
 
                 if (rReattach) {
                     writeState(runContext, taskRunId, resolvedResourceId, runId);
@@ -255,7 +260,7 @@ public abstract class AbstractQlikCloudRun extends AbstractQlikCloudTask impleme
 
     private QlikResourceResolver.ResolvedResource resolveByName(RunContext runContext, QlikCloudClient client, String rName, String rSpaceName) throws IOException {
         String spaceId = QlikResourceResolver.resolveSpaceId(client, rSpaceName);
-        QlikResourceResolver.ResolvedResource resolved = QlikResourceResolver.resolveResourceId(client, spaceId, rName, resourceType());
+        QlikResourceResolver.ResolvedResource resolved = QlikResourceResolver.resolveResourceId(client, spaceId, rSpaceName, rName, resourceType());
         runContext.logger().info("Resolved {} '{}' in space '{}' (id '{}') to id '{}'", resourceType(), rName, rSpaceName, spaceId, resolved.resourceId());
         return resolved;
     }
