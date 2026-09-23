@@ -128,27 +128,6 @@ class ReloadTest {
     }
 
     @Test
-    void retriesTriggerOn429HonoringRetryAfter(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
-        stubFor(post(urlEqualTo("/api/v1/reloads"))
-            .inScenario("429-retry")
-            .whenScenarioStateIs(Scenario.STARTED)
-            .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "1"))
-            .willSetStateTo("retried"));
-        stubFor(post(urlEqualTo("/api/v1/reloads"))
-            .inScenario("429-retry")
-            .whenScenarioStateIs("retried")
-            .willReturn(okJson("{\"id\": \"reload-3\", \"status\": \"QUEUED\"}")));
-
-        Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
-        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
-
-        Reload.Output output = task.run(runContext);
-
-        assertThat(output.getReloadId(), is("reload-3"));
-        verify(2, postRequestedFor(urlEqualTo("/api/v1/reloads")));
-    }
-
-    @Test
     void timesOutWhenStillRunningPastMaxDuration(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
         stubFor(post(urlEqualTo("/api/v1/reloads"))
             .willReturn(okJson("{\"id\": \"reload-4\", \"status\": \"QUEUED\"}")));
@@ -292,7 +271,7 @@ class ReloadTest {
     void failsFastOnPendingReloadInsteadOfRetryingAs429(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
         // A short Retry-After keeps this test fast: the underlying Apache HTTP client (which Kestra's
         // HttpClient does not expose a way to reconfigure) retries a 429 once on its own before our own
-        // code ever sees it, honoring this header. The point of this test is that RELOADS-007 must not
+        // code ever sees it, honoring this header. The point of this test is that our own client must not
         // add any further, additional backoff of its own on top of that single, unavoidable retry.
         stubFor(post(urlEqualTo("/api/v1/reloads"))
             .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "1").withBody("""
@@ -311,26 +290,39 @@ class ReloadTest {
     }
 
     @Test
-    void stillRetriesOrdinary429RateLimits(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+    void failsFastOn429WithoutRetryingEvenWithoutTheReloadsPendingErrorCode(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        // The spec documents no other meaning for a 429 on this endpoint, so the trigger POST never
+        // retries a 429 regardless of the error code — unlike an ordinary rate limit on other endpoints.
+        // No request-count assertion here: the underlying Apache HttpClient (see the comment on the
+        // sibling test above) retries a 429 once on its own before our own code ever sees the response,
+        // regardless of Retry-After; the point of this test is only the friendly, fail-fast message.
         stubFor(post(urlEqualTo("/api/v1/reloads"))
-            .inScenario("plain-429")
-            .whenScenarioStateIs(Scenario.STARTED)
-            .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "1").withBody("""
+            .willReturn(aResponse().withStatus(429).withBody("""
                 {"errors": [{"code": "TOO-MANY-REQUESTS", "title": "Too Many Requests", "detail": "slow down"}]}
-                """))
-            .willSetStateTo("retried"));
-        stubFor(post(urlEqualTo("/api/v1/reloads"))
-            .inScenario("plain-429")
-            .whenScenarioStateIs("retried")
-            .willReturn(okJson("{\"id\": \"reload-11\", \"status\": \"QUEUED\"}")));
+                """)));
 
         Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
         RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
 
-        Reload.Output output = task.run(runContext);
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
 
-        assertThat(output.getReloadId(), is("reload-11"));
-        verify(2, postRequestedFor(urlEqualTo("/api/v1/reloads")));
+        assertThat(e.getMessage(), allOf(containsString("already pending"), containsString("app-1")));
+    }
+
+    @Test
+    void failsWithQuotaMessageOn403ReloadFrequencyLimitReached(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(aResponse().withStatus(403).withBody("""
+                {"errors": [{"code": "RELOADS-013", "title": "Forbidden", "detail": "Reload frequency limit reached"}]}
+                """)));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
+
+        assertThat(e.getMessage(), allOf(containsString("quota"), containsString("app-1")));
+        verify(1, postRequestedFor(urlEqualTo("/api/v1/reloads")));
     }
 
     @Test

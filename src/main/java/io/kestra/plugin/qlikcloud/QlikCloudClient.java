@@ -9,7 +9,6 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -37,14 +36,10 @@ public final class QlikCloudClient implements Closeable {
     private static final Duration INITIAL_BACKOFF = Duration.ofSeconds(2);
     private static final Duration MAX_BACKOFF = Duration.ofSeconds(60);
 
-    // Qlik answers these with a 429 even though they are not a rate limit (e.g. a reload already
-    // pending for the same app): retrying them just delays an error that will never resolve on its own.
     // Note: the underlying Apache HttpClient (built by Kestra's own HttpClient, which exposes no
     // retry configuration) already retries a 429/503 once on its own, honoring Retry-After, before our
     // code ever sees the response — this is unavoidable through Kestra's public HTTP client API. What
-    // we control is not adding any further, additional backoff on top of that single hidden retry once
-    // we do see one of these codes.
-    private static final Set<String> NON_RETRIABLE_429_ERROR_CODES = Set.of("RELOADS-007");
+    // we control is not adding any further, additional backoff on top of that single hidden retry.
 
     private final HttpClient httpClient;
     private final String rTenantUrl;
@@ -84,16 +79,27 @@ public final class QlikCloudClient implements Closeable {
 
     /** GET, JSON body. Retries both 429 (honoring {@code Retry-After}) and 5xx. */
     public JsonNode get(String pathOrUrl) throws IOException {
-        return request("GET", pathOrUrl, null, true);
+        return request("GET", pathOrUrl, null, true, true);
     }
 
     /**
-     * POST, JSON body (or no body when {@code body} is null). Retries only 429: a 5xx or a
-     * transport failure is never retried here, so the trigger POST and the cancel/stop actions
-     * are never silently duplicated — see {@link io.kestra.plugin.qlikcloud.AbstractQlikCloudRun}.
+     * POST, JSON body (or no body when {@code body} is null), retrying a 429 (honoring
+     * {@code Retry-After}). A 5xx or a transport failure is never retried here, so the call is
+     * never silently duplicated — see {@link io.kestra.plugin.qlikcloud.AbstractQlikCloudRun}.
      */
     public JsonNode post(String pathOrUrl, Object body) throws IOException {
-        return request("POST", pathOrUrl, body, false);
+        return post(pathOrUrl, body, true);
+    }
+
+    /**
+     * POST, JSON body (or no body when {@code body} is null). {@code retry429} controls whether a
+     * 429 is retried like an ordinary rate limit: pass {@code false} for a POST whose 429 means
+     * "this specific request cannot succeed right now regardless of code" (e.g. the reload trigger,
+     * where a 429 always means a pending reload already exists for the app, per the Reloads API spec)
+     * rather than a generic throttle that a short wait resolves.
+     */
+    public JsonNode post(String pathOrUrl, Object body, boolean retry429) throws IOException {
+        return request("POST", pathOrUrl, body, false, retry429);
     }
 
     /**
@@ -119,7 +125,7 @@ public final class QlikCloudClient implements Closeable {
         }
     }
 
-    private JsonNode request(String method, String pathOrUrl, Object body, boolean retryServerErrors) throws IOException {
+    private JsonNode request(String method, String pathOrUrl, Object body, boolean retryServerErrors, boolean retry429) throws IOException {
         URI uri = resolveUri(pathOrUrl);
         Duration backoff = INITIAL_BACKOFF;
 
@@ -143,7 +149,7 @@ public final class QlikCloudClient implements Closeable {
                 int code = e.getResponse().getStatus().getCode();
                 boolean lastAttempt = attempt == MAX_ATTEMPTS;
 
-                if (code == 429 && !lastAttempt && !NON_RETRIABLE_429_ERROR_CODES.contains(extractErrorCode(e))) {
+                if (code == 429 && retry429 && !lastAttempt) {
                     sleep(retryAfter(e).orElse(backoff));
                     backoff = cappedDouble(backoff);
                     continue;

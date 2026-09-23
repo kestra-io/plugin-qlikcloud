@@ -100,12 +100,12 @@ class RunAutomationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"failed", "must stop", "stopped", "exceeded limit"})
+    @ValueSource(strings = {"failed", "stopped", "exceeded limit"})
     void failsOnFailureStatuses(String status, WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
         stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
             .willReturn(okJson("{\"id\": \"run-4\", \"status\": \"running\"}")));
         stubFor(get(urlEqualTo("/api/v1/automations/automation-1/runs/run-4"))
-            .willReturn(okJson("{\"id\": \"run-4\", \"status\": \"" + status + "\", \"message\": \"boom\"}")));
+            .willReturn(okJson("{\"id\": \"run-4\", \"status\": \"" + status + "\", \"error\": [{\"message\": \"boom\"}]}")));
         stubFor(get(urlEqualTo("/api/v1/automations/automation-1")).willReturn(okJson("{\"name\": \"My automation\"}")));
         stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
 
@@ -114,6 +114,46 @@ class RunAutomationTest {
 
         IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
         assertThat(e.getMessage(), allOf(containsString(status), containsString("boom")));
+    }
+
+    @Test
+    void errorArrayWithoutTextFieldFallsBackToCompactJson(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
+            .willReturn(okJson("{\"id\": \"run-4b\", \"status\": \"running\"}")));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1/runs/run-4b"))
+            .willReturn(okJson("{\"id\": \"run-4b\", \"status\": \"failed\", \"error\": [{\"code\": \"E42\"}]}")));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1")).willReturn(okJson("{\"name\": \"My automation\"}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
+
+        RunAutomation task = baseBuilder(wireMockRuntimeInfo).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
+        assertThat(e.getMessage(), allOf(containsString("failed"), containsString("E42")));
+    }
+
+    @Test
+    void mustStopKeepsPollingThenStoppedFails(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
+            .willReturn(okJson("{\"id\": \"run-4c\", \"status\": \"running\"}")));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1/runs/run-4c"))
+            .inScenario("must-stop")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("{\"id\": \"run-4c\", \"status\": \"must stop\"}"))
+            .willSetStateTo("stopped"));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1/runs/run-4c"))
+            .inScenario("must-stop")
+            .whenScenarioStateIs("stopped")
+            .willReturn(okJson("{\"id\": \"run-4c\", \"status\": \"stopped\", \"error\": [{\"message\": \"stopped by user\"}]}")));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1")).willReturn(okJson("{\"name\": \"My automation\"}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
+
+        RunAutomation task = baseBuilder(wireMockRuntimeInfo).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
+        assertThat(e.getMessage(), allOf(containsString("stopped"), containsString("stopped by user")));
+        verify(2, getRequestedFor(urlEqualTo("/api/v1/automations/automation-1/runs/run-4c")));
     }
 
     @Test

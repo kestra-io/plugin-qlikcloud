@@ -19,6 +19,7 @@ import jakarta.inject.Inject;
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.lessThan;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @KestraTest
@@ -88,6 +89,42 @@ class QlikCloudClientTest {
         RunContext runContext = runContextFactory.of(Map.of());
         try (QlikCloudClient client = QlikCloudClient.of(runContext, wireMockRuntimeInfo.getHttpBaseUrl(), "test-key")) {
             assertThrows(QlikCloudApiException.class, () -> client.get("/api/v1/apps/app-1"));
+        }
+    }
+
+    @Test
+    void postRetries429ByDefault(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
+            .inScenario("post-429-retry")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "1"))
+            .willSetStateTo("retried"));
+        stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
+            .inScenario("post-429-retry")
+            .whenScenarioStateIs("retried")
+            .willReturn(okJson("{\"id\": \"run-1\"}")));
+
+        RunContext runContext = runContextFactory.of(Map.of());
+        try (QlikCloudClient client = QlikCloudClient.of(runContext, wireMockRuntimeInfo.getHttpBaseUrl(), "test-key")) {
+            var body = client.post("/api/v1/automations/automation-1/runs", Map.of("context", "api"));
+            assertThat(body.path("id").asText(), is("run-1"));
+        }
+
+        verify(2, postRequestedFor(urlEqualTo("/api/v1/automations/automation-1/runs")));
+    }
+
+    @Test
+    void postWithRetry429DisabledFailsFastOn429(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads")).willReturn(aResponse().withStatus(429).withHeader("Retry-After", "1")));
+
+        RunContext runContext = runContextFactory.of(Map.of());
+        try (QlikCloudClient client = QlikCloudClient.of(runContext, wireMockRuntimeInfo.getHttpBaseUrl(), "test-key")) {
+            // No request-count assertion: the underlying Apache HttpClient retries a 429 once on its own
+            // before our own code ever sees the response, regardless of Retry-After. The timing bound below
+            // is what actually proves our own client adds no further, additional backoff on top of that.
+            long start = System.currentTimeMillis();
+            assertThrows(QlikCloudApiException.class, () -> client.post("/api/v1/reloads", Map.of("appId", "app-1"), false));
+            assertThat(System.currentTimeMillis() - start, lessThan(3000L));
         }
     }
 }

@@ -1,9 +1,12 @@
 package io.kestra.plugin.qlikcloud.automations;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
@@ -102,9 +105,14 @@ public class RunAutomation extends AbstractQlikCloudRun implements RunnableTask<
     // Cloud stops accepting it.
     private static final String RUN_CONTEXT_VALUE = "api";
 
-    private static final Set<String> TERMINAL_STATUSES = Set.of("finished", "finished with warnings", "failed", "must stop", "stopped", "exceeded limit");
-    private static final Set<String> FAILURE_STATUSES = Set.of("failed", "must stop", "stopped", "exceeded limit");
+    // "must stop" is intentionally excluded from both sets: the spec doesn't document it as final, and
+    // in practice it means a stop was requested but the run hasn't finished ending yet (Reload has an
+    // equivalent transitional status, "CANCELING") — it keeps polling like any other in-progress status.
+    private static final Set<String> TERMINAL_STATUSES = Set.of("finished", "finished with warnings", "failed", "stopped", "exceeded limit");
+    private static final Set<String> FAILURE_STATUSES = Set.of("failed", "stopped", "exceeded limit");
     private static final String WARNING_STATUS = "finished with warnings";
+    private static final List<String> ERROR_TEXT_FIELDS = List.of("message", "detail", "title", "description");
+    private static final int MAX_ERROR_MESSAGE_LENGTH = 2000;
 
     @Schema(title = "Automation ID", description = "Qlik Cloud automation identifier. Mutually exclusive with `spaceName` + `automationName`.")
     @PluginProperty(group = "main")
@@ -190,10 +198,32 @@ public class RunAutomation extends AbstractQlikCloudRun implements RunnableTask<
         boolean success = terminal && !FAILURE_STATUSES.contains(normalized) && !(warned && rFailOnWarnings);
         String errorMessage = null;
         if (terminal && !success) {
-            errorMessage = node.path("message").asText(null);
+            errorMessage = errorMessageFromNode(node);
         }
 
         return new RunStatus(status, terminal, success, errorMessage);
+    }
+
+    /** Builds a readable message from the run's `error[]` array — the run object has no top-level `message` field. */
+    private static String errorMessageFromNode(JsonNode node) {
+        JsonNode errors = node.path("error");
+        if (!errors.isArray() || errors.isEmpty()) {
+            return null;
+        }
+
+        String joined = StreamSupport.stream(errors.spliterator(), false)
+            .map(RunAutomation::errorEntryText)
+            .collect(Collectors.joining("; "));
+
+        return joined.length() > MAX_ERROR_MESSAGE_LENGTH ? joined.substring(0, MAX_ERROR_MESSAGE_LENGTH) : joined;
+    }
+
+    private static String errorEntryText(JsonNode entry) {
+        return ERROR_TEXT_FIELDS.stream()
+            .map(field -> entry.path(field).asText(null))
+            .filter(text -> text != null && !text.isBlank())
+            .findFirst()
+            .orElseGet(entry::toString);
     }
 
     @Override
@@ -271,7 +301,13 @@ public class RunAutomation extends AbstractQlikCloudRun implements RunnableTask<
         @Schema(title = "Space ID", description = "Id of the Qlik Cloud space containing the automation.")
         private final String spaceId;
 
-        @Schema(title = "Run status", description = "One of the documented Qlik Automate statuses, e.g. `not started`, `running`, `finished`, `finished with warnings`, `failed`, `stopped`, `must stop`, `exceeded limit`.")
+        @Schema(
+            title = "Run status",
+            description = """
+                One of the documented Qlik Automate statuses. Final: `finished`, `finished with warnings`, \
+                `failed`, `stopped`, `exceeded limit`. Still running: `not started`, `starting`, `queued`, \
+                `running`, `must stop` (a stop was requested but the run hasn't finished ending yet)."""
+        )
         private final String status;
 
         @Schema(title = "Start time")

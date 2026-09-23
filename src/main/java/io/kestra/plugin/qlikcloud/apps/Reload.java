@@ -224,11 +224,18 @@ public class Reload extends AbstractQlikCloudRun implements RunnableTask<Reload.
 
         JsonNode response;
         try {
-            response = client.post("/api/v1/reloads", body);
+            // A 429 on this endpoint always means a reload is already pending for this app (Qlik Reloads
+            // API spec), never a generic rate limit, so it is never retried — see QlikCloudClient.post.
+            response = client.post("/api/v1/reloads", body, false);
         } catch (QlikCloudApiException e) {
-            if ("RELOADS-007".equals(e.errorCode())) {
+            if (e.statusCode() == 429) {
                 throw new IllegalStateException(
                     "A reload is already pending/in progress for app '" + resolvedAppId + "'; wait for it to finish or cancel it.", e
+                );
+            }
+            if (e.statusCode() == 403 && "RELOADS-013".equals(e.errorCode())) {
+                throw new IllegalStateException(
+                    "The reload frequency quota for app '" + resolvedAppId + "' has been reached for this tenant; try again later or reduce the reload frequency.", e
                 );
             }
             if (e.statusCode() == 404) {
