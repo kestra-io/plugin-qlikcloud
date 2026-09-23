@@ -1,10 +1,10 @@
 {
-  "name": "plugin-template",
+  "name": "plugin-qlikcloud",
   "build": {
     "context": ".",
     "dockerfile": "Dockerfile"
   },
-  "workspaceFolder": "/workspaces/plugin-template",
+  "workspaceFolder": "/workspaces/plugin-qlikcloud",
   "forwardPorts": [8080],
   "customizations": {
     "vscode": {
