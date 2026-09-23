@@ -156,6 +156,25 @@ class QlikResourceResolverTest {
     }
 
     @Test
+    void refusesToFollowANextLinkOnTheSameHostButADifferentPort(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        String tenantUrl = wireMockRuntimeInfo.getHttpBaseUrl();
+        int foreignPort = wireMockRuntimeInfo.getHttpPort() + 1;
+        String sameHostDifferentPort = tenantUrl.replace(":" + wireMockRuntimeInfo.getHttpPort(), ":" + foreignPort);
+
+        stubFor(
+            get(urlPathEqualTo("/api/v1/spaces"))
+                .willReturn(okJson("""
+                    {"data": [{"id": "space-0", "name": "Sales Analytics Old"}], "links": {"next": {"href": "%s/api/v1/spaces?page=2"}}}
+                    """.formatted(sameHostDifferentPort)))
+        );
+
+        QlikCloudClient client = client(wireMockRuntimeInfo);
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> QlikResourceResolver.resolveSpaceId(client, "Sales Analytics"));
+        assertThat(e.getMessage(), containsString(":" + foreignPort));
+        verify(1, getRequestedFor(urlPathEqualTo("/api/v1/spaces")));
+    }
+
+    @Test
     void followsARelativeNextLinkResolvedAgainstTheTenant(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
         stubFor(
             get(urlPathEqualTo("/api/v1/spaces"))

@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
@@ -119,7 +120,9 @@ public final class QlikResourceResolver {
      */
     private static String requireSameTenant(String href, URI tenantUri) {
         URI resolved = tenantUri.resolve(href);
-        boolean sameOrigin = Objects.equals(resolved.getScheme(), tenantUri.getScheme()) && Objects.equals(resolved.getHost(), tenantUri.getHost());
+        boolean sameOrigin = Objects.equals(resolved.getScheme(), tenantUri.getScheme())
+            && Objects.equals(resolved.getHost(), tenantUri.getHost())
+            && effectivePort(resolved) == effectivePort(tenantUri);
 
         if (!sameOrigin) {
             throw new IllegalStateException(
@@ -129,6 +132,20 @@ public final class QlikResourceResolver {
         }
 
         return resolved.toString();
+    }
+
+    // URI.getPort() is -1 when the URI carries no explicit port, which must not be compared literally:
+    // https://tenant.example.com and https://tenant.example.com:443 are the same origin, but a foreign
+    // https://tenant.example.com:8443 (or an http downgrade, port 80) must not be treated as the tenant.
+    private static int effectivePort(URI uri) {
+        if (uri.getPort() != -1) {
+            return uri.getPort();
+        }
+        return switch (uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT)) {
+            case "https" -> 443;
+            case "http" -> 80;
+            default -> -1;
+        };
     }
 
     private static String idList(List<JsonNode> nodes, String idField) {
