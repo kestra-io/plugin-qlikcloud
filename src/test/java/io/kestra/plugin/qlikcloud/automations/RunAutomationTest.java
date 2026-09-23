@@ -133,6 +133,26 @@ class RunAutomationTest {
     }
 
     @Test
+    void errorArrayUsesErrorKeyAsReturnedByQlikAutomate(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
+            .willReturn(okJson("{\"id\": \"run-4d\", \"status\": \"running\"}")));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1/runs/run-4d"))
+            .willReturn(okJson("""
+                {"status":"failed","title":null,"error":[{"error":"cURL error 6: Could not resolve host: kestra-qa.invalid (see https://curl.se/libcurl/c/libcurl-errors.html) for https://kestra-qa.invalid/fail"}]}
+                """)));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1")).willReturn(okJson("{\"name\": \"My automation\"}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
+
+        RunAutomation task = baseBuilder(wireMockRuntimeInfo).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
+        assertThat(e.getMessage(), containsString(
+            "cURL error 6: Could not resolve host: kestra-qa.invalid (see https://curl.se/libcurl/c/libcurl-errors.html) for https://kestra-qa.invalid/fail"
+        ));
+    }
+
+    @Test
     void mustStopKeepsPollingThenStoppedFails(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
         stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
             .willReturn(okJson("{\"id\": \"run-4c\", \"status\": \"running\"}")));

@@ -111,7 +111,7 @@ public class RunAutomation extends AbstractQlikCloudRun implements RunnableTask<
     private static final Set<String> TERMINAL_STATUSES = Set.of("finished", "finished with warnings", "failed", "stopped", "exceeded limit");
     private static final Set<String> FAILURE_STATUSES = Set.of("failed", "stopped", "exceeded limit");
     private static final String WARNING_STATUS = "finished with warnings";
-    private static final List<String> ERROR_TEXT_FIELDS = List.of("message", "detail", "title", "description");
+    private static final List<String> ERROR_TEXT_FIELDS = List.of("error", "message", "detail", "title", "description");
     private static final int MAX_ERROR_MESSAGE_LENGTH = 2000;
 
     @Schema(title = "Automation ID", description = "Qlik Cloud automation identifier. Mutually exclusive with `spaceName` + `automationName`.")
