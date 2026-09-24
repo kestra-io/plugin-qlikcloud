@@ -153,6 +153,23 @@ class RunAutomationTest {
     }
 
     @Test
+    void errorArrayWithPlainStringEntryRendersWithoutJsonQuotes(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
+            .willReturn(okJson("{\"id\": \"run-4e\", \"status\": \"running\"}")));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1/runs/run-4e"))
+            .willReturn(okJson("{\"status\":\"failed\",\"error\":[\"plain text\"]}")));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1")).willReturn(okJson("{\"name\": \"My automation\"}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
+
+        RunAutomation task = baseBuilder(wireMockRuntimeInfo).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> task.run(runContext));
+        assertThat(e.getMessage(), containsString("plain text"));
+        assertThat(e.getMessage(), not(containsString("\"plain text\"")));
+    }
+
+    @Test
     void mustStopKeepsPollingThenStoppedFails(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
         stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
             .willReturn(okJson("{\"id\": \"run-4c\", \"status\": \"running\"}")));

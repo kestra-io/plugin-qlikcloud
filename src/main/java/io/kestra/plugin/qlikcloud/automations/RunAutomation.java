@@ -223,7 +223,9 @@ public class RunAutomation extends AbstractQlikCloudRun implements RunnableTask<
             .map(field -> entry.path(field).asText(null))
             .filter(text -> text != null && !text.isBlank())
             .findFirst()
-            .orElseGet(entry::toString);
+            // A bare string entry (e.g. `"error": ["plain text"]`) has no field to extract: render its
+            // text as-is rather than falling through to compact JSON, which would wrap it in quotes.
+            .orElseGet(() -> entry.isTextual() ? entry.asText() : entry.toString());
     }
 
     @Override
