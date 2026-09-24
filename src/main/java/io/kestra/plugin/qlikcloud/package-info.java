@@ -1,6 +1,6 @@
 @PluginSubGroup(
     title = "Qlik Cloud",
-    description = "Qlik Cloud plugin for Kestra",
+    description = "Trigger Qlik Cloud app reloads and Qlik Automate automation runs from a Kestra flow.",
     categories = PluginSubGroup.PluginCategory.DATA
 )
 package io.kestra.plugin.qlikcloud;

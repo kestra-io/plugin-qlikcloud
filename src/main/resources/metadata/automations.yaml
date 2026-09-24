@@ -1,0 +1,8 @@
+group: io.kestra.plugin.qlikcloud.automations
+name: "automations"
+title: "Qlik Cloud Automations"
+description: "Tasks that trigger and monitor Qlik Automate automation runs"
+body: "Use this task to start a run of a Qlik Automate automation and, by default, wait for it to reach a final status."
+videos: []
+createdBy: "Kestra Core Team"
+managedBy: "Kestra Core Team"
