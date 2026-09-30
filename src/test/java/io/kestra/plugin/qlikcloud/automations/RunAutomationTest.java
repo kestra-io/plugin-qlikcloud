@@ -1,5 +1,6 @@
 package io.kestra.plugin.qlikcloud.automations;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -18,6 +19,10 @@ import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.runners.RunContextFactory;
+import io.kestra.core.storages.kv.KVMetadata;
+import io.kestra.core.storages.kv.KVValueAndMetadata;
+import io.kestra.core.utils.Hashing;
+import io.kestra.core.utils.Slugify;
 import io.kestra.core.utils.TestsUtils;
 
 import jakarta.inject.Inject;
@@ -237,6 +242,62 @@ class RunAutomationTest {
 
         assertThat(output.getRunId(), is("run-6"));
         assertThat(output.getStatus(), is("finished"));
+        verify(1, postRequestedFor(urlEqualTo("/api/v1/automations/automation-1/runs")));
+    }
+
+    // Key layout of the removed RunContext.stateStore(): a run stored by Kestra 1.x must still be adopted.
+    private static String legacyStateKey(RunContext runContext) {
+        return Slugify.of(runContext.flowInfo().id()) + "_states_qlik-cloud_run_" + Hashing.hashToString(runContext.taskRunInfo().taskRunId());
+    }
+
+    @Test
+    void reattachAdoptsRunStoredUnderLegacyStateStoreKey(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        RunAutomation task = baseBuilder(wireMockRuntimeInfo).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+        runContext.namespaceKv(runContext.flowInfo().namespace()).put(
+            legacyStateKey(runContext),
+            new KVValueAndMetadata(null, "{\"resourceId\":\"automation-1\",\"runId\":\"run-legacy\"}".getBytes(StandardCharsets.UTF_8))
+        );
+
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1/runs/run-legacy"))
+            .willReturn(okJson("{\"id\": \"run-legacy\", \"status\": \"finished\"}")));
+        stubFor(get(urlEqualTo("/api/v1/automations/automation-1")).willReturn(okJson("{\"name\": \"My automation\"}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
+
+        RunAutomation.Output output = task.run(runContext);
+
+        assertThat(output.getRunId(), is("run-legacy"));
+        verify(0, postRequestedFor(urlEqualTo("/api/v1/automations/automation-1/runs")));
+    }
+
+    @Test
+    void reattachTriggersNewRunWhenStoredStateExpired(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        RunAutomation task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+        runContext.namespaceKv(runContext.flowInfo().namespace()).put(
+            legacyStateKey(runContext),
+            new KVValueAndMetadata(new KVMetadata(null, Duration.ofMillis(1)), "{\"resourceId\":\"automation-1\",\"runId\":\"run-old\"}".getBytes(StandardCharsets.UTF_8))
+        );
+        Thread.sleep(50);
+
+        stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
+            .willReturn(okJson("{\"id\": \"run-new\", \"status\": \"running\"}")));
+
+        RunAutomation.Output output = task.run(runContext);
+
+        assertThat(output.getRunId(), is("run-new"));
+        verify(1, postRequestedFor(urlEqualTo("/api/v1/automations/automation-1/runs")));
+    }
+
+    @Test
+    void reattachTriggersNewRunWhenNoStoredState(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/automations/automation-1/runs"))
+            .willReturn(okJson("{\"id\": \"run-fresh\", \"status\": \"running\"}")));
+
+        RunAutomation task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunAutomation.Output output = task.run(TestsUtils.mockRunContext(runContextFactory, task, Map.of()));
+
+        assertThat(output.getRunId(), is("run-fresh"));
         verify(1, postRequestedFor(urlEqualTo("/api/v1/automations/automation-1/runs")));
     }
 

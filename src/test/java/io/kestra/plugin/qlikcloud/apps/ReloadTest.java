@@ -1,5 +1,6 @@
 package io.kestra.plugin.qlikcloud.apps;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -18,6 +19,10 @@ import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.runners.RunContextFactory;
+import io.kestra.core.storages.kv.KVMetadata;
+import io.kestra.core.storages.kv.KVValueAndMetadata;
+import io.kestra.core.utils.Hashing;
+import io.kestra.core.utils.Slugify;
 import io.kestra.core.utils.TestsUtils;
 
 import jakarta.inject.Inject;
@@ -209,6 +214,63 @@ class ReloadTest {
 
         assertThat(output.getReloadId(), is("reload-7"));
         assertThat(output.getStatus(), is("SUCCEEDED"));
+        verify(1, postRequestedFor(urlEqualTo("/api/v1/reloads")));
+    }
+
+    // Key layout of the removed RunContext.stateStore(): a run stored by Kestra 1.x must still be adopted.
+    private static String legacyStateKey(RunContext runContext) {
+        return Slugify.of(runContext.flowInfo().id()) + "_states_qlik-cloud_run_" + Hashing.hashToString(runContext.taskRunInfo().taskRunId());
+    }
+
+    @Test
+    void reattachAdoptsRunStoredUnderLegacyStateStoreKey(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        Reload task = baseBuilder(wireMockRuntimeInfo).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+        runContext.namespaceKv(runContext.flowInfo().namespace()).put(
+            legacyStateKey(runContext),
+            new KVValueAndMetadata(null, "{\"resourceId\":\"app-1\",\"runId\":\"reload-legacy\"}".getBytes(StandardCharsets.UTF_8))
+        );
+
+        stubFor(get(urlEqualTo("/api/v1/reloads/reload-legacy"))
+            .willReturn(okJson("{\"id\": \"reload-legacy\", \"status\": \"SUCCEEDED\"}")));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1/reloads/logs/reload-legacy")).willReturn(aResponse().withStatus(404)));
+        stubFor(get(urlEqualTo("/api/v1/apps/app-1")).willReturn(okJson("{\"attributes\": {}}")));
+        stubFor(get(urlPathEqualTo("/api/v1/items")).willReturn(okJson("{\"data\": []}")));
+
+        Reload.Output output = task.run(runContext);
+
+        assertThat(output.getReloadId(), is("reload-legacy"));
+        verify(0, postRequestedFor(urlEqualTo("/api/v1/reloads")));
+    }
+
+    @Test
+    void reattachTriggersNewRunWhenStoredStateExpired(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+        runContext.namespaceKv(runContext.flowInfo().namespace()).put(
+            legacyStateKey(runContext),
+            new KVValueAndMetadata(new KVMetadata(null, Duration.ofMillis(1)), "{\"resourceId\":\"app-1\",\"runId\":\"reload-old\"}".getBytes(StandardCharsets.UTF_8))
+        );
+        Thread.sleep(50);
+
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-new\", \"status\": \"QUEUED\"}")));
+
+        Reload.Output output = task.run(runContext);
+
+        assertThat(output.getReloadId(), is("reload-new"));
+        verify(1, postRequestedFor(urlEqualTo("/api/v1/reloads")));
+    }
+
+    @Test
+    void reattachTriggersNewRunWhenNoStoredState(WireMockRuntimeInfo wireMockRuntimeInfo) throws Exception {
+        stubFor(post(urlEqualTo("/api/v1/reloads"))
+            .willReturn(okJson("{\"id\": \"reload-fresh\", \"status\": \"QUEUED\"}")));
+
+        Reload task = baseBuilder(wireMockRuntimeInfo).wait(Property.ofValue(false)).build();
+        Reload.Output output = task.run(TestsUtils.mockRunContext(runContextFactory, task, Map.of()));
+
+        assertThat(output.getReloadId(), is("reload-fresh"));
         verify(1, postRequestedFor(urlEqualTo("/api/v1/reloads")));
     }
 
