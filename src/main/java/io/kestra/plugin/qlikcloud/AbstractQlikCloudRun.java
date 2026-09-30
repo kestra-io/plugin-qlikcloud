@@ -1,6 +1,5 @@
 package io.kestra.plugin.qlikcloud;
 
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -22,6 +21,11 @@ import io.kestra.core.models.annotations.PluginProperty;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.storages.kv.KVStore;
+import io.kestra.core.storages.kv.KVValue;
+import io.kestra.core.storages.kv.KVValueAndMetadata;
+import io.kestra.core.utils.Hashing;
+import io.kestra.core.utils.Slugify;
 
 import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.AccessLevel;
@@ -273,22 +277,40 @@ public abstract class AbstractQlikCloudRun extends AbstractQlikCloudTask impleme
         return resolved;
     }
 
+    // Same key layout as the removed RunContext.stateStore() (flow-scoped, hashed task run id), so a run
+    // started on Kestra 1.x is still adopted after an upgrade to 2.x.
+    private static String stateKey(RunContext runContext, String taskRunId) {
+        return Slugify.of(runContext.flowInfo().id()) + "_states_" + STATE_NAME + "_" + STATE_SUB_NAME + "_" + Hashing.hashToString(taskRunId);
+    }
+
+    private static KVStore stateKv(RunContext runContext) throws IOException {
+        return runContext.namespaceKv(runContext.flowInfo().namespace());
+    }
+
     private static StoredRun readState(RunContext runContext, String taskRunId) throws IOException {
-        try (var stream = runContext.stateStore().getState(STATE_NAME, STATE_SUB_NAME, taskRunId)) {
-            JsonNode node = JacksonMapper.ofJson().readTree(stream);
-            return new StoredRun(node.path("resourceId").asText(), node.path("runId").asText());
-        } catch (FileNotFoundException | ResourceExpiredException e) {
+        Optional<KVValue> stored;
+        try {
+            stored = stateKv(runContext).getValue(stateKey(runContext, taskRunId));
+        } catch (ResourceExpiredException e) {
             return null;
         }
+        if (stored.isEmpty() || stored.get().value() == null) {
+            return null;
+        }
+        Object value = stored.get().value();
+        JsonNode node = value instanceof byte[] bytes
+            ? JacksonMapper.ofJson().readTree(bytes)
+            : JacksonMapper.ofJson().readTree(value.toString());
+        return new StoredRun(node.path("resourceId").asText(), node.path("runId").asText());
     }
 
     private static void writeState(RunContext runContext, String taskRunId, String resourceId, String runId) throws IOException {
         String json = JacksonMapper.ofJson().writeValueAsString(Map.of("resourceId", resourceId, "runId", runId));
-        runContext.stateStore().putState(STATE_NAME, STATE_SUB_NAME, taskRunId, json.getBytes(StandardCharsets.UTF_8));
+        stateKv(runContext).put(stateKey(runContext, taskRunId), new KVValueAndMetadata(null, json.getBytes(StandardCharsets.UTF_8)));
     }
 
     private static void deleteState(RunContext runContext, String taskRunId) throws IOException {
-        runContext.stateStore().deleteState(STATE_NAME, STATE_SUB_NAME, taskRunId);
+        stateKv(runContext).delete(stateKey(runContext, taskRunId));
     }
 
     @Override
