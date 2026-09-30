@@ -277,8 +277,7 @@ public abstract class AbstractQlikCloudRun extends AbstractQlikCloudTask impleme
         return resolved;
     }
 
-    // Same key layout as the removed RunContext.stateStore() (flow-scoped, hashed task run id), so a run
-    // started on Kestra 1.x is still adopted after an upgrade to 2.x.
+    // Same key layout as the removed stateStore(), so a run started on Kestra 1.x is adopted after upgrading to 2.x.
     private static String stateKey(RunContext runContext, String taskRunId) {
         return Slugify.of(runContext.flowInfo().id()) + "_states_" + STATE_NAME + "_" + STATE_SUB_NAME + "_" + Hashing.hashToString(taskRunId);
     }
